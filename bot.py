@@ -15,7 +15,8 @@ from scheduler import (
     stop_scheduler,
     schedule_message_job,
     stop_job,
-    send_interval_message # Import this for interval messages
+    send_interval_message,
+    set_client
 )
 import config
 
@@ -40,32 +41,63 @@ def parse_cron_expression(time_str: str, message_text: str) -> str | None:
 
 # --- Pyrogram Message Handlers ---
 async def handle_addgroup(client: Client, message: Message):
-    if message.chat.type not in ["group", "supergroup"]:
-        await message.reply_text("This command can only be used in a group or supergroup.")
+    if message.chat.type != "private":
+        await message.reply_text("Please use this command in private chat with the bot.")
         return
 
-    chat_id = message.chat.id
-    if add_group(chat_id):
-        await message.reply_text(f"✅ Group '{message.chat.title}' ({chat_id}) added to announcement list.")
-        # Optionally, start an interval message here if needed for all groups
-        # Or wait for a specific /schedule command
-    else:
-        await message.reply_text("❌ Failed to add group. Please check logs.")
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2:
+        await message.reply_text("Usage: `/addgroup <link or @username or group_id>`\nExample: `/addgroup https://t.me/mygroupname` or `/addgroup @mygroupname` or `/addgroup -1001234567890`")
+        return
+
+    target = parts[1].strip()
+
+    try:
+        # Try joining the group first (works for public groups/channels via link or username)
+        try:
+            await client.join_chat(target)
+            logger.info(f"Bot joined chat: {target}")
+        except Exception as join_err:
+            logger.info(f"Join attempt for {target}: {join_err} (may already be member)")
+
+        # Resolve the chat to get its ID and title
+        chat = await client.get_chat(target)
+        chat_id = chat.id
+
+        if add_group(chat_id):
+            await message.reply_text(f"✅ Group **{chat.title}** (`{chat_id}`) added to announcement list.")
+        else:
+            await message.reply_text("❌ Failed to add group to database.")
+    except Exception as e:
+        logger.error(f"Error adding group {target}: {e}")
+        await message.reply_text(f"❌ Could not add group. Make sure the link/username/id is correct and the bot can access it.\nError: `{e}`")
 
 async def handle_removegroup(client: Client, message: Message):
-    if message.chat.type not in ["group", "supergroup"]:
-        await message.reply_text("This command can only be used in a group or supergroup.")
+    if message.chat.type != "private":
+        await message.reply_text("Please use this command in private chat with the bot.")
         return
 
-    chat_id = message.chat.id
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2:
+        await message.reply_text("Usage: `/removegroup <group_id>`")
+        return
+
+    try:
+        chat_id = int(parts[1].strip())
+    except ValueError:
+        await message.reply_text("Please provide a numeric group ID. Use `/listgroups` to see IDs.")
+        return
+
     if remove_group(chat_id):
-        await message.reply_text(f"✅ Group '{message.chat.title}' ({chat_id}) removed from announcement list.")
-        # You might want to stop any scheduled jobs associated with this group here.
-        # This would require mapping group_id to job_id and using stop_job.
+        await message.reply_text(f"✅ Group `{chat_id}` removed from announcement list.")
     else:
         await message.reply_text("❌ Failed to remove group. Please check logs.")
 
 async def handle_listgroups(client: Client, message: Message):
+    if message.chat.type != "private":
+        await message.reply_text("Please use this command in private chat with the bot.")
+        return
+
     groups = get_all_groups()
     if not groups:
         await message.reply_text("No groups are currently registered.")
@@ -82,15 +114,12 @@ async def handle_listgroups(client: Client, message: Message):
     await message.reply_text(group_list_text)
 
 async def handle_schedule(client: Client, message: Message):
-    """Schedules a daily announcement."""
-    if message.chat.type not in ["group", "supergroup"]:
-        await message.reply_text("This command can only be used in a group or supergroup.")
+    """Schedules a daily announcement to ALL registered groups."""
+    if message.chat.type != "private":
+        await message.reply_text("Please use this command in private chat with the bot.")
         return
 
-    chat_id = message.chat.id
-    # Expected format: /schedule HH:MM Message text
-    # We need to split the command carefully.
-    parts = message.text.split(maxsplit=2) # Split into at most 3 parts: command, time, message
+    parts = message.text.split(maxsplit=2)
 
     if len(parts) < 3:
         await message.reply_text("Usage: `/schedule HH:MM Your announcement message here.`")
@@ -105,15 +134,15 @@ async def handle_schedule(client: Client, message: Message):
         await message.reply_text("Invalid time format. Please use HH:MM (e.g., `14:30`).")
         return
 
-    # Ensure the group is registered before scheduling
-    if chat_id not in get_all_groups():
-        await message.reply_text("This group is not registered. Please use `/addgroup` first.")
+    groups = get_all_groups()
+    if not groups:
+        await message.reply_text("No groups registered. Use `/addgroup` first.")
         return
 
-    job_id = schedule_message_job(chat_id, announcement_message, cron_expression)
+    job_id = schedule_message_job(groups, announcement_message, cron_expression)
 
     if job_id:
-        await message.reply_text(f"✅ Announcement scheduled for `{time_str}` daily in this group.\nJob ID: `{job_id}`")
+        await message.reply_text(f"✅ Announcement scheduled for `{time_str}` UTC daily to {len(groups)} group(s).\nJob ID: `{job_id}`")
     else:
         await message.reply_text("❌ Failed to schedule announcement. Please check logs.")
 
@@ -134,17 +163,11 @@ async def handle_stop_schedule(client: Client, message: Message):
         await message.reply_text("❌ Failed to stop announcement. Job ID not found or already stopped. Please check logs.")
 
 async def handle_interval_message(client: Client, message: Message):
-    """
-    Handles the /interval command to send messages every X seconds.
-    This is a simplified implementation. A more robust version would
-    manage these interval jobs more explicitly and have a way to stop them.
-    """
-    if message.chat.type not in ["group", "supergroup"]:
-        await message.reply_text("This command can only be used in a group or supergroup.")
+    """Schedules interval messages to ALL registered groups."""
+    if message.chat.type != "private":
+        await message.reply_text("Please use this command in private chat with the bot.")
         return
 
-    chat_id = message.chat.id
-    # Expected format: /interval <seconds> Message
     parts = message.text.split(maxsplit=2)
 
     if len(parts) < 3:
@@ -155,28 +178,19 @@ async def handle_interval_message(client: Client, message: Message):
         interval_seconds = int(parts[1])
         interval_message = parts[2]
 
-        if interval_seconds <= 0:
-            await message.reply_text("Interval must be a positive number of seconds.")
+        if interval_seconds < 15:
+            await message.reply_text("Minimum interval is 15 seconds.")
             return
 
-        # Limit the interval to prevent spamming and hitting rate limits easily
-        # You might want to make this configurable or enforce stricter limits.
-        if interval_seconds < 15: # Example: Minimum 15 seconds
-            await message.reply_text("Minimum interval is 15 seconds to prevent abuse.")
+        groups = get_all_groups()
+        if not groups:
+            await message.reply_text("No groups registered. Use `/addgroup` first.")
             return
 
-        # Ensure the group is registered
-        if chat_id not in get_all_groups():
-            await message.reply_text("This group is not registered. Please use `/addgroup` first.")
-            return
-
-        # Note: The send_interval_message function in scheduler.py is a placeholder.
-        # You MUST implement the actual sending logic within that function or a callback it uses.
-        # This function needs access to the Pyrogram client.
-        job_id = send_interval_message(chat_id, interval_message, interval_seconds)
+        job_id = send_interval_message(groups, interval_message, interval_seconds)
 
         if job_id:
-            await message.reply_text(f"✅ Interval messages scheduled for every {interval_seconds} seconds in this group.\nJob ID: `{job_id}`\nNote: The message sending logic needs to be implemented in `scheduler.py`.")
+            await message.reply_text(f"✅ Interval messages scheduled every {interval_seconds}s to {len(groups)} group(s).\nJob ID: `{job_id}`")
         else:
             await message.reply_text("❌ Failed to schedule interval message. Please check logs.")
 
@@ -195,46 +209,46 @@ async def main():
     # Start APScheduler
     start_scheduler()
 
-    # Initialize Pyrogram Client
+    # Initialize Pyrogram User Client (messages will be sent from your personal account)
     try:
         app = Client(
-            "announcement_bot",
+            "user_session",
             api_id=config.API_ID,
             api_hash=config.API_HASH,
-            bot_token=config.BOT_TOKEN
+            phone_number=config.PHONE_NUMBER
         )
         await app.start()
-        logger.info("Pyrogram client started.")
+        set_client(app)  # Pass user client to scheduler for sending messages
+        logger.info("Pyrogram user client started.")
     except Exception as e:
         logger.critical(f"Failed to start Pyrogram client: {e}")
         sys.exit(1)
 
     # --- Command Filters ---
-    bot_username = (await app.get_me()).username
-    command_prefix = "/" # Or use @command_prefix for inline bot commands if you were using inline mode
+    command_prefix = "/"
 
     # Add commands
-    @app.on_message(filters.command("addgroup", prefixes=command_prefix) & filters.private)
+    @app.on_message(filters.command("addgroup", prefixes=command_prefix))
     async def addgroup_command(client, message):
         await handle_addgroup(client, message)
 
-    @app.on_message(filters.command("removegroup", prefixes=command_prefix) & filters.private)
+    @app.on_message(filters.command("removegroup", prefixes=command_prefix))
     async def removegroup_command(client, message):
         await handle_removegroup(client, message)
 
-    @app.on_message(filters.command("listgroups", prefixes=command_prefix) & filters.private)
+    @app.on_message(filters.command("listgroups", prefixes=command_prefix))
     async def listgroups_command(client, message):
         await handle_listgroups(client, message)
 
-    @app.on_message(filters.command("schedule", prefixes=command_prefix) & filters.private)
+    @app.on_message(filters.command("schedule", prefixes=command_prefix))
     async def schedule_command(client, message):
         await handle_schedule(client, message)
 
-    @app.on_message(filters.command("stop", prefixes=command_prefix) & filters.private)
+    @app.on_message(filters.command("stop", prefixes=command_prefix))
     async def stop_command(client, message):
         await handle_stop_schedule(client, message)
 
-    @app.on_message(filters.command("interval", prefixes=command_prefix) & filters.private)
+    @app.on_message(filters.command("interval", prefixes=command_prefix))
     async def interval_command(client, message):
         await handle_interval_message(client, message)
 
