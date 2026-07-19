@@ -20,9 +20,9 @@ from scheduler import (
 )
 import config
 
-# --- Global Client Instance ---
-# It's often easier to manage a single client instance.
-app = None
+# --- Global Client Instances ---
+bot_app = None   # Bot client - commands ke liye
+user_app = None  # User client - messages bhejne ke liye
 
 # --- Helper to parse cron expressions ---
 def parse_cron_expression(time_str: str, message_text: str) -> str | None:
@@ -202,74 +202,71 @@ async def handle_interval_message(client: Client, message: Message):
 
 
 async def main():
-    global app
-    # Initialize Database
+    global bot_app, user_app
     init_db()
-
-    # Start APScheduler
     start_scheduler()
 
-    # Initialize Pyrogram User Client (messages will be sent from your personal account)
+    # User client - messages bhejega groups mein (teri ID se)
     try:
-        app = Client(
+        user_app = Client(
             "user_session",
             api_id=config.API_ID,
             api_hash=config.API_HASH,
             phone_number=config.PHONE_NUMBER
         )
-        await app.start()
-        set_client(app)  # Pass user client to scheduler for sending messages
-        logger.info("Pyrogram user client started.")
+        await user_app.start()
+        set_client(user_app)
+        logger.info("User client started.")
     except Exception as e:
-        logger.critical(f"Failed to start Pyrogram client: {e}")
+        logger.critical(f"Failed to start user client: {e}")
+        sys.exit(1)
+
+    # Bot client - commands accept karega
+    try:
+        bot_app = Client(
+            "bot_session",
+            api_id=config.API_ID,
+            api_hash=config.API_HASH,
+            bot_token=config.BOT_TOKEN
+        )
+        await bot_app.start()
+        logger.info("Bot client started.")
+    except Exception as e:
+        logger.critical(f"Failed to start bot client: {e}")
         sys.exit(1)
 
     # --- Command Filters ---
     command_prefix = "/"
 
-    # Add commands
-    @app.on_message(filters.command("addgroup", prefixes=command_prefix))
+    @bot_app.on_message(filters.command("addgroup", prefixes=command_prefix) & filters.private)
     async def addgroup_command(client, message):
-        await handle_addgroup(client, message)
+        await handle_addgroup(user_app, message)
 
-    @app.on_message(filters.command("removegroup", prefixes=command_prefix))
+    @bot_app.on_message(filters.command("removegroup", prefixes=command_prefix) & filters.private)
     async def removegroup_command(client, message):
         await handle_removegroup(client, message)
 
-    @app.on_message(filters.command("listgroups", prefixes=command_prefix))
+    @bot_app.on_message(filters.command("listgroups", prefixes=command_prefix) & filters.private)
     async def listgroups_command(client, message):
         await handle_listgroups(client, message)
 
-    @app.on_message(filters.command("schedule", prefixes=command_prefix))
+    @bot_app.on_message(filters.command("schedule", prefixes=command_prefix) & filters.private)
     async def schedule_command(client, message):
         await handle_schedule(client, message)
 
-    @app.on_message(filters.command("stop", prefixes=command_prefix))
+    @bot_app.on_message(filters.command("stop", prefixes=command_prefix) & filters.private)
     async def stop_command(client, message):
         await handle_stop_schedule(client, message)
 
-    @app.on_message(filters.command("interval", prefixes=command_prefix))
+    @bot_app.on_message(filters.command("interval", prefixes=command_prefix) & filters.private)
     async def interval_command(client, message):
         await handle_interval_message(client, message)
 
-    # --- Forwarding to groups ---
-    # To make the bot add groups, you need to send the /addgroup command
-    # from a PRIVATE CHAT with the bot.
-    # The bot itself needs to be added to the groups it will manage.
-    # When the bot is added to a group, it receives messages with chat.id referring to that group.
-    # However, it cannot *itself* execute commands like /addgroup within a group it's in.
-    # The current implementation requires admin intervention to add/remove groups via PM.
-
-    # If you want to be able to execute commands *from* a group (e.g., /addgroup in a group),
-    # the `filters.private` needs to be removed, and you'd check `message.chat.type`
-    # to ensure it's a group/supergroup command.
-    # For simplicity, this example uses private chat commands for management.
-
     logger.info("Bot is running. Press Ctrl+C to stop.")
-    await asyncio.Future()  # Run forever
+    await asyncio.Future()
 
-    # --- Cleanup ---
-    await app.stop()
+    await bot_app.stop()
+    await user_app.stop()
     stop_scheduler()
 
 if __name__ == "__main__":
@@ -280,10 +277,12 @@ if __name__ == "__main__":
     except Exception as e:
         logger.critical(f"An unexpected error occurred: {e}")
     finally:
-        # Ensure cleanup happens even on unexpected errors
-        if app and app.is_connected:
+        if user_app and user_app.is_connected:
             loop = asyncio.get_event_loop()
-            loop.run_until_complete(app.stop())
+            loop.run_until_complete(user_app.stop())
+        if bot_app and bot_app.is_connected:
+            loop = asyncio.get_event_loop()
+            loop.run_until_complete(bot_app.stop())
         stop_scheduler()
         logger.info("Bot shutdown complete.")
 
