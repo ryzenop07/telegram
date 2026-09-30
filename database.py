@@ -12,12 +12,23 @@ def init_db():
         c = conn.cursor()
         c.execute('''
             CREATE TABLE IF NOT EXISTS groups (
-                chat_id INTEGER PRIMARY KEY,
+                chat_id INTEGER UNIQUE,
                 title TEXT,
                 interval_multiplier REAL DEFAULT 1.0,
                 is_failed INTEGER DEFAULT 0
             )
         ''')
+        # Migrate old schema — add missing columns if not exist
+        for col, definition in [
+            ("interval_multiplier", "REAL DEFAULT 1.0"),
+            ("is_failed", "INTEGER DEFAULT 0"),
+        ]:
+            try:
+                c.execute(f"ALTER TABLE groups ADD COLUMN {col} {definition}")
+            except Exception:
+                pass
+        c.execute("UPDATE groups SET interval_multiplier=1.0 WHERE interval_multiplier IS NULL")
+        c.execute("UPDATE groups SET is_failed=0 WHERE is_failed IS NULL")
         c.execute('''
             CREATE TABLE IF NOT EXISTS schedules (
                 job_id TEXT PRIMARY KEY,
@@ -111,6 +122,7 @@ def add_group(chat_id, title=""):
     try:
         conn = sqlite3.connect(DB_NAME)
         c = conn.cursor()
+        # Works with both old schema (has username col) and new schema
         c.execute("INSERT OR IGNORE INTO groups (chat_id, title) VALUES (?, ?)", (chat_id, title))
         c.execute("UPDATE groups SET title=? WHERE chat_id=?", (title, chat_id))
         conn.commit()

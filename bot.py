@@ -56,6 +56,14 @@ def parse_cron(time_str):
 
 async def join_and_add(target: str):
     try:
+        # Normalize t.me links → pyrogram format
+        target = target.strip()
+        if "t.me/+" in target or "t.me/joinchat" in target:
+            # Private invite link — use as-is
+            pass
+        elif "t.me/" in target:
+            # Public link like https://t.me/groupname → @groupname
+            target = "@" + target.split("t.me/")[-1].strip("/")
         try:
             await user_app.join_chat(target)
         except UserAlreadyParticipant:
