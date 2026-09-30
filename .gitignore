@@ -1,0 +1,9 @@
+config.py
+*.session
+*.session-journal
+*.db
+__pycache__/
+.DS_Store
+venv/
+*.pyc
+get_my_id.py
