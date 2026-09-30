@@ -68,6 +68,35 @@ async def join_and_add(target: str):
         return None, str(e)
 
 # ── Handlers ───────────────────────────────────────────────────────────────────
+@bot_app.on_message(filters.command("help") & filters.private & allowed_filter)
+async def help_cmd(client, message: Message):
+    await message.reply(
+        "📋 **Available Commands**\n\n"
+        "👥 **Groups**\n"
+        "`/addgroup <link/@username/id>` — Group add karo\n"
+        "`/removegroup <group_id>` — Group remove karo\n"
+        "`/listgroups` — Saare groups dekho\n"
+        "`/autojoin` — Saare saved groups mein rejoin karo\n\n"
+        "📨 **Messaging**\n"
+        "`/interval <seconds> <message>` — Har X seconds pe message bhejo\n"
+        "`/schedule <HH:MM> <message>` — Daily ek time pe message bhejo (UTC)\n"
+        "`/stop <job_id>` — Koi bhi job band karo\n\n"
+        "⚠️ **Spam / Fail**\n"
+        "`/faillist` — Failed groups ki list dekho\n"
+        "`/clearfail <group_id>` — Ek group fail list se hatao\n"
+        "`/clearfail all` — Saare failed groups clear karo\n\n"
+        "👤 **Users (sirf owner)**\n"
+        "`/adduser <user_id>` — Kisi ko bot access do\n"
+        "`/removeuser <user_id>` — Kisi ka access hatao\n"
+        "`/listusers` — Allowed users dekho\n\n"
+        "💡 **Examples**\n"
+        "`/addgroup @mygroup`\n"
+        "`/interval 60 Hello everyone!`\n"
+        "`/schedule 14:30 Aaj meeting hai!`\n"
+        "`/stop interval_abc123`"
+    )
+
+
 @bot_app.on_message(filters.command("adduser") & filters.private & owner_filter)
 async def adduser_cmd(client, message: Message):
     parts = message.text.split(maxsplit=1)
