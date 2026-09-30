@@ -79,11 +79,11 @@ def get_allowed_users():
     try:
         conn = sqlite3.connect(DB_NAME)
         c = conn.cursor()
-        c.execute("SELECT user_id FROM allowed_users")
-        return {row[0] for row in c.fetchall()}
+        c.execute("SELECT user_id, added_by FROM allowed_users")
+        return c.fetchall()
     except Exception as e:
         logger.error(f"get_allowed_users error: {e}")
-        return set()
+        return []
     finally:
         if conn:
             conn.close()
@@ -92,23 +92,14 @@ def get_allowed_users():
 def is_user_allowed(user_id, owner_id):
     if user_id == owner_id:
         return True
-    return user_id in get_allowed_users()
-
-
     conn = None
     try:
         conn = sqlite3.connect(DB_NAME)
         c = conn.cursor()
-        c.execute(
-            "INSERT OR IGNORE INTO groups (chat_id, title) VALUES (?, ?)",
-            (chat_id, title)
-        )
-        # update title if already exists
-        c.execute("UPDATE groups SET title=? WHERE chat_id=?", (title, chat_id))
-        conn.commit()
-        return True
+        c.execute("SELECT 1 FROM allowed_users WHERE user_id=?", (user_id,))
+        return c.fetchone() is not None
     except Exception as e:
-        logger.error(f"add_group error: {e}")
+        logger.error(f"is_user_allowed error: {e}")
         return False
     finally:
         if conn:
