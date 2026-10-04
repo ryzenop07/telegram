@@ -16,6 +16,7 @@ from pyrogram.errors import (
 from database import (
     get_active_schedules, save_schedule, deactivate_schedule,
     get_group_multiplier, set_group_multiplier, mark_group_failed,
+    get_last_message_id, set_last_message_id, clear_last_message_id
 )
 from logger import logger
 
@@ -52,14 +53,27 @@ def get_client(user_id: int = None):
     return _default_client
 
 
-async def _send_with_retry(client, chat_id: int, message: str, multiplier: float, user_id: int = 0):
-    """Send to one group using the appropriate client, handle all exceptions."""
+async def _send_with_retry(client, chat_id: int, message: str, multiplier: float, user_id: int = 0, delete_prev: bool = False):
+    """Send to one group. If delete_prev=True, deletes last sent message first (for interval/schedule jobs)."""
     if not client:
         logger.error(f"No Pyrogram client available for {chat_id}")
         return False
 
+    # Delete previous interval/schedule message if requested
+    if delete_prev:
+        prev_msg_id = get_last_message_id(user_id, chat_id)
+        if prev_msg_id:
+            try:
+                await client.delete_messages(chat_id, prev_msg_id)
+                logger.info(f"🗑️ Deleted prev msg {prev_msg_id} in {chat_id}")
+            except Exception:
+                pass
+            clear_last_message_id(user_id, chat_id)
+
     try:
         sent = await client.send_message(chat_id, message)
+        if delete_prev:
+            set_last_message_id(user_id, chat_id, sent.id)
         logger.info(f"✅ Sent to {chat_id} (msg_id={sent.id})")
         _error_counts[chat_id] = 0
         if multiplier > 1.0:
@@ -131,7 +145,7 @@ async def send_to_all_groups(chat_ids: list, message: str, base_interval: int = 
             extra = base_interval * (multiplier - 1.0)
             await asyncio.sleep(min(extra, 60))  # cap at 60s extra
 
-        await _send_with_retry(client, chat_id, message, multiplier, user_id=user_id or 0)
+        await _send_with_retry(client, chat_id, message, multiplier, user_id=user_id or 0, delete_prev=True)
 
 
 def _increment_error(chat_id):
