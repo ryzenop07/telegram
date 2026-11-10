@@ -318,7 +318,8 @@ async def spread_spam_loop(job_id: str, chat_ids: list, message: str,
 
             logger.info(f"[spam] Attempting send to {chat_id}")
             slowmode = get_slowmode(chat_id)
-            multiplier = get_group_multiplier(chat_id)            custom_msg = get_group_custom_message(user_id, chat_id)
+            multiplier = get_group_multiplier(chat_id)
+            custom_msg = get_group_custom_message(user_id, chat_id)
             varied_msg = _vary_message(custom_msg if custom_msg else message)
 
             sent = False
