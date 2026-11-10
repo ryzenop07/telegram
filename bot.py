@@ -2,7 +2,8 @@
 import asyncio
 import re
 
-from pyrogram import Client, filters
+from pyrogram import Client, filters, raw
+import pyrogram.handlers
 from pyrogram.types import Message, Chat
 from pyrogram.errors import (
     UserAlreadyParticipant, InviteHashExpired, InviteHashInvalid,
@@ -22,7 +23,9 @@ from database import (
     get_failed_groups, clear_group_failed,
     add_allowed_user, remove_allowed_user, get_allowed_users, is_user_allowed,
     update_user_session, get_user_session, get_all_user_sessions, clear_user_session,
-    add_keyword, remove_keyword, get_all_keywords, get_keyword_count, find_reply
+    add_keyword, remove_keyword, get_all_keywords, get_keyword_count, find_reply,
+    get_slowmode, set_slowmode,
+    get_group_multiplier, set_group_multiplier
 )
 from scheduler import (
     start_scheduler, stop_scheduler,
@@ -30,7 +33,7 @@ from scheduler import (
     send_interval_message, set_client,
     register_client, unregister_client, scheduler,
     start_spread_spam, stop_spread_spam,
-    stop_all_spread_spam, get_spread_jobs
+    stop_all_spread_spam, get_spread_jobs, get_pinned_groups
 )
 import config
 
@@ -40,13 +43,26 @@ user_clients = {}
 # user_id -> {"phone": ..., "client": ..., "phone_code_hash": ..., "step": ...}
 login_states = {}
 
-user_app = Client(
-    "user_session",
-    api_id=config.API_ID,
-    api_hash=config.API_HASH,
-    phone_number=config.PHONE_NUMBER,
-    parse_mode=ParseMode.MARKDOWN
-)
+# Owner session — use string if available in DB, else file
+_owner_session = get_user_session(config.OWNER_ID)
+_owner_sstr = _owner_session[2] if _owner_session and _owner_session[2] else None
+
+if _owner_sstr:
+    user_app = Client(
+        f"user_{config.OWNER_ID}",
+        api_id=config.API_ID,
+        api_hash=config.API_HASH,
+        session_string=_owner_sstr,
+        parse_mode=ParseMode.MARKDOWN
+    )
+else:
+    user_app = Client(
+        "user_session",
+        api_id=config.API_ID,
+        api_hash=config.API_HASH,
+        phone_number=config.PHONE_NUMBER,
+        parse_mode=ParseMode.MARKDOWN
+    )
 
 bot_app = Client(
     "bot_session",
@@ -87,9 +103,8 @@ async def auto_join_db_groups(uclient, uid: int, notify_chat_id: int = None):
             ok += 1
         except Exception as e:
             err = str(e)
-            # Skip noisy non-fatal errors silently
-            if "CHANNEL_INVALID" in err or "CHAT_ID_INVALID" in err:
-                ok += 1  # Already member, channel just not resolvable by ID
+            if any(x in err for x in ["CHANNEL_INVALID", "CHAT_ID_INVALID", "CHANNEL_PRIVATE", "GetMessages"]):
+                ok += 1  # Already member or inaccessible — not a real failure
             else:
                 fail += 1
                 logger.warning(f"Auto-join failed {title or chat_id} for user {uid}: {e}")
@@ -143,6 +158,14 @@ async def join_and_add(target: str, added_by: int = 0):
             return None, "Invite link expired."
         chat = await uclient.get_chat(target)
         add_group(chat.id, chat.title or "", added_by)
+        # Fetch and save slowmode delay
+        try:
+            slowmode = getattr(chat, 'slowmode_delay', 0) or 0
+            if slowmode > 0:
+                set_slowmode(chat.id, slowmode)
+                logger.info(f"Group {chat.id} slowmode={slowmode}s saved")
+        except Exception:
+            pass
         return chat, None
     except Exception as e:
         return None, str(e)
@@ -150,14 +173,23 @@ async def join_and_add(target: str, added_by: int = 0):
 # ── /help ──────────────────────────────────────────────────────────────────────
 @bot_app.on_message(filters.command("help") & filters.private & allowed_filter)
 async def help_cmd(client, message: Message):
+    is_owner = message.from_user.id == config.OWNER_ID
+    owner_section = (
+        "👤 **Users** _(sirf owner)_\n"
+        "`/adduser [user_id]` — Kisi ko access do\n"
+        "`/removeuser [user_id]` — Access hatao\n"
+        "`/listusers` — Allowed users dekho\n"
+        "`/getsession [phone]` — Kisi bhi number ka session bot se generate karo\n\n"
+    ) if is_owner else ""
+
     await message.reply(
         "📋 **Bot Commands**\n\n"
 
         "🔐 **Account & Session**\n"
-        "`/login [phone]` — Telegram account connect karo\n"
+        "`/login [phone]` — Apna Telegram account connect karo\n"
         "`/otp [code]` — OTP enter karo\n"
         "`/password [pwd]` — 2FA password (agar ho)\n"
-        "`/session [string]` — Pyrogram session string se connect karo\n"
+        "`/session [string]` — Session string se connect karo\n"
         "`/myaccount` — Connected account status dekho\n"
         "`/logout` — Account disconnect karo\n\n"
 
@@ -165,43 +197,132 @@ async def help_cmd(client, message: Message):
         "`/addgroup [link/@username/id]` — Group add + auto join\n"
         "`/removegroup [group_id]` — Group remove karo\n"
         "`/listgroups` — Registered groups dekho\n"
-        "`/syncgroups` — Account ke saare joined groups DB mein sync karo\n"
+        "`/syncgroups` — Joined groups DB mein sync karo\n"
         "`/autojoin` — DB ke saare groups mein rejoin karo\n\n"
 
-        "📡 **Channel Scan** _(Auto Join from Channel Links)_\n"
-        "`/scanchannel [@username/id]` — Channel ke messages se group links nikal ke auto-join karo\n"
-        "`/stopscan` — Chal raha scan band karo\n\n"
+        "📡 **Channel Scan**\n"
+        "`/scanchannel [@username/id]` — Channel se group links nikal ke auto-join karo\n"
+        "`/stopscan` — Scan band karo\n\n"
 
-        "📨 **Safe Messaging (No Ban)**\n"
-        "`/spreadspam [seconds] [message]` — Ek ek group mein gap de ke spam karo (Safe ✅)\n"
-        "`/stopspread` — Saari spreadspam jobs band karo\n\n"
-
-        "⚠️ **Aggressive Messaging (High Risk)**\n"
-        "`/interval [seconds] [message]` — Ek saath saare groups mein spam (Ban Risk! ❌)\n"
-        "`/schedule [HH:MM] [message]` — Saare groups mein daily ek time pe (UTC)\n"
-        "`/spamgroup [id/@username] [sec] [msg]` — Ek specific group mein spam\n"
-        "`/stopspam [group_id]` — Ek specific group ka spam band karo\n"
-        "`/stop [job_id]` — Koi bhi job ID band karo\n"
-        "`/listjobs` — Active jobs dekho\n\n"
+        "📨 **Spam**\n"
+        "`/spam [message]` — Saare groups mein spam (failed groups skip honge)\n"
+        "`/spamgroup [id] [seconds] [msg]` — Specific group mein fixed interval pe spam\n"
+        "`/stopspam` — Spam band karo\n\n"
 
         "⚠️ **Failed Groups**\n"
         "`/faillist` — Failed groups ki list\n"
         "`/clearfail [group_id]` — Ek group fail list se hatao\n"
-        "`/clearfail all` — Saare failed groups clear karo\n\n"
+        "`/clearfail all` — Saare failed groups clear karo\n"
+        "_(Failed group mein spam tabhi hoga jab /clearfail karo)_\n\n"
 
-        "👤 **Users** _(sirf owner)_\n"
-        "`/adduser [user_id]` — Kisi ko access do\n"
-        "`/removeuser [user_id]` — Access hatao\n"
-        "`/listusers` — Allowed users dekho\n\n"
+        + owner_section +
 
-        "💡 **Quick Examples**\n"
-        "`/session BQA...` — Session se login\n"
-        "`/syncgroups` — Joined groups sync karo\n"
-        "`/scanchannel @mylinkchannel` — Channel scan karo\n"
-        "`/spreadspam 60 Aaj sale hai!` — Safe spam, har group mein 60s gap\n"
-        "`/spamgroup @mygroup 120 Hello!` — Ek group mein 2 min pe spam"
-        "`/listjobs` — Active sab dekho"
+        "💡 **Examples**\n"
+        "`/getsession +91XXXXXXXXXX` — Session generate karo\n"
+        "`/syncgroups` — Groups sync karo\n"
+        "`/spam Aaj sale hai!` — Spam shuru\n"
+        "`/spamgroup -100123 10 Hello!` — Specific group mein 10s pe spam"
     )
+
+# ── /getsession ──────────────────────────────────────────────────────────────
+_getsession_states: dict = {}  # owner_id -> {phone, client, hash, step}
+
+@bot_app.on_message(filters.command("getsession") & filters.private & owner_filter)
+async def getsession_cmd(client, message: Message):
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2:
+        await message.reply("Usage: `/getsession +91XXXXXXXXXX`")
+        return
+    phone = parts[1].strip().replace(" ", "")
+    status_msg = await message.reply(f"🔄 `{phone}` pe OTP bheja ja raha hai...")
+    try:
+        temp = Client(f"gs_{phone.replace('+','')}", api_id=config.API_ID, api_hash=config.API_HASH, in_memory=True)
+        await temp.connect()
+        sent = await temp.send_code(phone)
+        _getsession_states[message.from_user.id] = {
+            "phone": phone, "client": temp,
+            "hash": sent.phone_code_hash, "step": "otp"
+        }
+        await status_msg.edit_text(
+            f"📩 OTP bhej diya `{phone}` pe!\n"
+            f"Code bhejo: `/gsotp 12345`"
+        )
+    except Exception as e:
+        await status_msg.edit_text(f"❌ Error: `{e}`")
+
+
+@bot_app.on_message(filters.command("gsotp") & filters.private & owner_filter)
+async def gsotp_cmd(client, message: Message):
+    uid = message.from_user.id
+    state = _getsession_states.get(uid)
+    if not state or state["step"] != "otp":
+        await message.reply("❌ Pehle `/getsession [phone]` karo.")
+        return
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2:
+        await message.reply("Usage: `/gsotp [code]`")
+        return
+    code = parts[1].strip().replace(" ", "").replace("-", "")
+    temp = state["client"]
+    status_msg = await message.reply("🔄 Verifying...")
+    try:
+        await temp.sign_in(phone_number=state["phone"], phone_code_hash=state["hash"], phone_code=code)
+    except SessionPasswordNeeded:
+        state["step"] = "pwd"
+        await status_msg.edit_text("🔒 2FA password chahiye: `/gspwd your_password`")
+        return
+    except PhoneCodeInvalid:
+        await status_msg.edit_text("❌ Galat OTP. Dobara try karo.")
+        return
+    except PhoneCodeExpired:
+        _getsession_states.pop(uid, None)
+        await status_msg.edit_text("❌ OTP expire. `/getsession` dobara karo.")
+        return
+    except Exception as e:
+        await status_msg.edit_text(f"❌ Error: `{e}`")
+        return
+    sstr = await temp.export_session_string()
+    me = await temp.get_me()
+    await temp.disconnect()
+    _getsession_states.pop(uid, None)
+    await status_msg.edit_text(
+        f"✅ **Session Ready!**\n"
+        f"👤 {me.first_name} (`{me.id}`)\n\n"
+        f"🔑 **String Session:**\n`{sstr}`\n\n"
+        f"Is string ko `/session` command mein use karo."
+    )
+
+
+@bot_app.on_message(filters.command("gspwd") & filters.private & owner_filter)
+async def gspwd_cmd(client, message: Message):
+    uid = message.from_user.id
+    state = _getsession_states.get(uid)
+    if not state or state["step"] != "pwd":
+        await message.reply("❌ Pehle `/getsession` karo.")
+        return
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2:
+        await message.reply("Usage: `/gspwd [password]`")
+        return
+    temp = state["client"]
+    status_msg = await message.reply("🔄 Verifying 2FA...")
+    try:
+        await temp.check_password(parts[1].strip())
+        sstr = await temp.export_session_string()
+        me = await temp.get_me()
+        await temp.disconnect()
+        _getsession_states.pop(uid, None)
+        await status_msg.edit_text(
+            f"✅ **Session Ready!**\n"
+            f"👤 {me.first_name} (`{me.id}`)\n\n"
+            f"🔑 **String Session:**\n`{sstr}`\n\n"
+            f"Is string ko `/session` command mein use karo."
+        )
+    except PasswordHashInvalid:
+        await status_msg.edit_text("❌ Galat password. Dobara: `/gspwd [pwd]`")
+    except Exception as e:
+        await status_msg.edit_text(f"❌ Error: `{e}`")
+
 
 # ── /adduser ───────────────────────────────────────────────────────────────────
 @bot_app.on_message(filters.command("adduser") & filters.private & owner_filter)
@@ -563,23 +684,65 @@ async def syncgroups_cmd(client, message: Message):
 
     status_msg = await message.reply("🔄 Syncing... aapke account ke saare joined groups fetch ho rahe hain.")
     added, skipped = 0, 0
-    try:
-        async for dialog in uclient.get_dialogs():
-            chat = dialog.chat
-            if chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
-                if add_group(chat.id, chat.title or "", uid):
-                    added += 1
-                else:
-                    skipped += 1
-        await status_msg.edit_text(
-            f"✅ **Sync complete!**\n"
-            f"• Naye groups add hue: {added}\n"
-            f"• Already added the: {skipped}\n"
-            f"• Total active: {len(get_all_groups(uid))}"
-        )
-    except Exception as e:
-        logger.error(f"Sync error for {uid}: {e}")
-        await status_msg.edit_text(f"❌ Sync error: `{e}`")
+    offset_date, offset_id, offset_peer = 0, 0, raw.types.InputPeerEmpty()
+    while True:
+        try:
+            r = await uclient.invoke(
+                raw.functions.messages.GetDialogs(
+                    offset_date=offset_date,
+                    offset_id=offset_id,
+                    offset_peer=offset_peer,
+                    limit=100,
+                    hash=0,
+                    exclude_pinned=False,
+                    folder_id=None,
+                )
+            )
+        except Exception as e:
+            logger.warning(f"[syncgroups] GetDialogs error: {e}")
+            break
+        if not hasattr(r, 'dialogs') or not r.dialogs:
+            break
+        chats = {c.id: c for c in r.chats}
+        for d in r.dialogs:
+            try:
+                peer = d.peer
+                if isinstance(peer, (raw.types.PeerChat, raw.types.PeerChannel)):
+                    cid = getattr(peer, 'chat_id', None) or getattr(peer, 'channel_id', None)
+                    chat_obj = chats.get(cid)
+                    if not chat_obj:
+                        continue
+                    # skip channels (broadcast), only groups/supergroups
+                    is_group = isinstance(chat_obj, raw.types.Chat)
+                    is_supergroup = isinstance(chat_obj, raw.types.Channel) and getattr(chat_obj, 'megagroup', False)
+                    if not (is_group or is_supergroup):
+                        continue
+                    full_id = -cid if is_group else int(f"-100{cid}")
+                    title = getattr(chat_obj, 'title', '') or ''
+                    slowmode = getattr(chat_obj, 'slowmode_delay', 0) or 0
+                    if add_group(full_id, title, uid):
+                        added += 1
+                        if slowmode > 0:
+                            set_slowmode(full_id, slowmode)
+                    else:
+                        skipped += 1
+            except Exception:
+                pass
+        if len(r.dialogs) < 100:
+            break
+        last = r.dialogs[-1]
+        last_peer = last.peer
+        offset_id = last.top_message
+        last_msg = next((m for m in r.messages if m.id == last.top_message), None)
+        offset_date = getattr(last_msg, 'date', 0) or 0
+        cid = getattr(last_peer, 'chat_id', None) or getattr(last_peer, 'channel_id', None) or getattr(last_peer, 'user_id', None)
+        offset_peer = await uclient.resolve_peer(cid) if cid else raw.types.InputPeerEmpty()
+    await status_msg.edit_text(
+        f"✅ **Sync complete!**\n"
+        f"• Naye groups add hue: {added}\n"
+        f"• Already DB mein the: {skipped}\n"
+        f"• Total active: {len(get_all_groups(uid))}"
+    )
 
 # ── /autojoin ──────────────────────────────────────────────────────────────────
 @bot_app.on_message(filters.command("autojoin") & filters.private & allowed_filter)
@@ -1069,204 +1232,99 @@ async def interval_cmd(client, message: Message):
 # ── /spamgroup ─────────────────────────────────────────────────────────────────
 @bot_app.on_message(filters.command("spamgroup") & filters.private & allowed_filter)
 async def spamgroup_cmd(client, message: Message):
-    """
-    Spam a message to ONE specific group at a fixed interval.
-    Usage: /spamgroup [group_id or @username] [seconds] Your message
-    Example: /spamgroup -1001234567890 300 Hello everyone!
-    Example: /spamgroup @mygroup 120 Check this out!
-    """
     uid = message.from_user.id
     parts = message.text.split(maxsplit=3)
     if len(parts) < 4:
         await message.reply(
-            "**Usage:**\n"
-            "`/spamgroup [group_id/@username] [seconds] Your message`\n\n"
-            "**Examples:**\n"
-            "`/spamgroup -1001234567890 300 Hello!`\n"
-            "`/spamgroup @mygroup 120 Check this out!`\n\n"
-            "⚠️ Minimum interval: 60 seconds"
+            "**Usage:** `/spamgroup [group_id/@username] [seconds] [message]`\n"
+            "**Example:** `/spamgroup -1001234567890 10 Hello!`"
         )
         return
-
     group_target = parts[1].strip()
     try:
         seconds = int(parts[2])
     except ValueError:
-        await message.reply("❌ Seconds numeric hona chahiye. Example: `300`")
+        await message.reply("❌ Seconds numeric hona chahiye.")
         return
-
-    if seconds < 60:
-        await message.reply("⚠️ Minimum 60 seconds — spam ban se bachne ke liye.")
+    if seconds < 5:
+        await message.reply("⚠️ Minimum 5 seconds.")
         return
-
     msg_text = parts[3]
     uclient = get_user_client(uid)
     if not uclient:
-        await message.reply("⚠️ Pehle apna account connect karein via `/session`")
+        await message.reply("⚠️ Pehle `/session` se account connect karo.")
         return
-
-    status_msg = await message.reply(f"🔄 Group verify kar raha hoon: `{group_target}`...")
+    status_msg = await message.reply("🔄 Group verify ho raha hai...")
     try:
-        # Resolve group — numeric ID or @username
         if group_target.lstrip("-").isdigit():
             chat_id = int(group_target)
             chat = await uclient.get_chat(chat_id)
         else:
             chat = await uclient.get_chat(group_target)
             chat_id = chat.id
-
         title = getattr(chat, "title", str(chat_id))
-
-        # Schedule the spam job for this single group
-        job_id = send_interval_message([chat_id], msg_text, seconds, user_id=uid)
-        if job_id:
-            await status_msg.edit_text(
-                f"✅ **Spam started!**\n\n"
-                f"📢 Group: **{title}**\n"
-                f"🆔 Chat ID: `{chat_id}`\n"
-                f"⏱ Interval: every `{seconds}` seconds\n"
-                f"📝 Message: `{msg_text[:80]}{'...' if len(msg_text)>80 else ''}`\n\n"
-                f"🛑 Band karne ke liye:\n`/stopspam {chat_id}`"
-            )
-        else:
-            await status_msg.edit_text("❌ Spam schedule nahi hua. Dobara try karo.")
     except Exception as e:
-        logger.error(f"spamgroup error for {uid} → {group_target}: {e}")
+        await status_msg.edit_text(f"❌ Group resolve nahi hua: `{e}`")
+        return
+    existing = [jid for jid in get_spread_jobs(uid) if str(chat_id) in jid]
+    for jid in existing:
+        stop_spread_spam(jid)
+    job_id = start_spread_spam([chat_id], msg_text, seconds, uid, pinned=True)
+    if job_id:
         await status_msg.edit_text(
-            f"❌ Group resolve nahi hua: `{e}`\n\n"
-            f"**Tips:**\n"
-            f"• Numeric ID use karo: `-1001234567890`\n"
-            f"• Ya `/syncgroups` se pehle groups add karo"
+            f"✅ **Group Spam shuru!**\n"
+            f"📢 **{title}** (`{chat_id}`)\n"
+            f"⏱ Interval: `{seconds}s`\n"
+            f"📝 `{msg_text[:80]}`\n\n"
+            f"🛑 Band karne ke liye: `/stopspam`"
         )
+    else:
+        await status_msg.edit_text("❌ Client not found. Bot restart karo.")
 
-# ── /stopspam ──────────────────────────────────────────────────────────────────
-@bot_app.on_message(filters.command("stopspam") & filters.private & allowed_filter)
-async def stopspam_cmd(client, message: Message):
-    """
-    Stop spam for a specific group.
-    Usage: /stopspam [chat_id]
-    Shows matching jobs and stops them all for that group.
-    """
+# ── /spam ──────────────────────────────────────────────────────────────────────
+@bot_app.on_message(filters.command("spam") & filters.private & allowed_filter)
+async def spam_cmd(client, message: Message):
     uid = message.from_user.id
     parts = message.text.split(maxsplit=1)
     if len(parts) < 2:
-        await message.reply(
-            "**Usage:** `/stopspam [chat_id]`\n\n"
-            "Chat ID `/spamgroup` command se milta hai.\n"
-            "Ya `/listjobs` se saari jobs dekho."
-        )
+        await message.reply("Usage: `/spam [message]`\nExample: `/spam Aaj sale hai!`")
         return
-
-    target = parts[1].strip()
-    jobs = scheduler.get_jobs()
-    is_owner = (uid == config.OWNER_ID)
-
-    stopped = []
-    for job in jobs:
-        # Only stop jobs belonging to this user
-        if not is_owner and f"_{uid}_" not in job.id:
-            continue
-        # Match by chat_id in job args
-        try:
-            job_chat_ids = job.args[0] if job.args else []
-            if any(str(cid) == target for cid in job_chat_ids):
-                stop_job(job.id)
-                stopped.append(job.id)
-        except Exception:
-            continue
-
-    if stopped:
-        await message.reply(
-            f"🛑 **Spam stopped!**\n\n"
-            f"Group `{target}` ke liye {len(stopped)} job(s) band ho gayi:\n" +
-            "\n".join(f"• `{jid}`" for jid in stopped)
-        )
-    else:
-        await message.reply(
-            f"❌ Group `{target}` ke liye koi active spam job nahi mili.\n"
-            f"Active jobs dekhne ke liye: `/listjobs`"
-        )
-
-# ── /spreadspam ──────────────────────────────────────────────────────────────────
-@bot_app.on_message(filters.command("spreadspam") & filters.private & allowed_filter)
-async def spreadspam_cmd(client, message: Message):
-    """
-    Rolling spam: ek ek group mein gap de ke spam karo.
-    Kabhi ek saath nahi — spam ban se bachao.
-
-    Usage: /spreadspam [seconds_gap] Your message
-    Example: /spreadspam 60 Aaj sale hai!
-             → Group1 → 60s wait → Group2 → 60s wait → ... → phir Group1
-    """
-    uid = message.from_user.id
-    parts = message.text.split(maxsplit=2)
-    if len(parts) < 3:
-        await message.reply(
-            "🔄 **Spread Spam** — ek ek group mein gap de ke\n\n"
-            "**Usage:** `/spreadspam [seconds] Message`\n\n"
-            "**Example:**\n"
-            "`/spreadspam 60 Aaj offer hai!`\n"
-            "`/spreadspam 120 Join karo!`\n\n"
-            "ℹ️ Kaise kaam karta hai:\n"
-            "• Group 1 → wait Xs → Group 2 → wait Xs → ... → phir Group 1\n"
-            "• Kabhi ek saath blast nahi — spam ban ka risk near zero\n"
-            "• 100 groups + 60s gap = ek full round 100 minutes mein\n\n"
-            "🛑 Band karne ke liye: `/stopspread`"
-        )
-        return
-
-    try:
-        gap = int(parts[1])
-    except ValueError:
-        await message.reply("❌ Seconds number hona chahiye. Example: `/spreadspam 60 Hello!`")
-        return
-
-    if gap < 5:
-        await message.reply("⚠️ Minimum 5 seconds gap.")
-        return
-
-    msg_text = parts[2]
-    groups = get_all_groups(uid)
-    if not groups:
-        await message.reply("⚠️ Koi group DB mein nahi. Pehle `/syncgroups` ya `/scanchannel` karo.")
-        return
-
     uclient = get_user_client(uid)
     if not uclient:
-        await message.reply("⚠️ Pehle apna account connect karein via `/session`")
+        await message.reply("⚠️ Pehle `/session` se account connect karo.")
         return
-
-    # Stop existing spread jobs for this user
-    prev = stop_all_spread_spam(uid)
-
-    job_id = start_spread_spam(groups, msg_text, gap, uid)
-
-    cycle_time_min = round((len(groups) * gap) / 60, 1)
+    groups = get_all_groups(uid)
+    if not groups:
+        await message.reply("⚠️ Koi group nahi. Pehle `/syncgroups` karo.")
+        return
+    # Pinned groups skip karo — unka apna spamgroup chal raha hai
+    pinned = get_pinned_groups(uid)
+    groups = [g for g in groups if g not in pinned]
+    if not groups:
+        await message.reply("⚠️ Saare groups already `/spamgroup` se chal rahe hain.")
+        return
+    stop_all_spread_spam(uid)
+    job_id = start_spread_spam(groups, parts[1], 0, uid)
+    if not job_id:
+        await message.reply("❌ Client not found. Bot restart karo aur dobara `/session` lagao.")
+        return
     await message.reply(
-        f"🔄 **Spread Spam Started!**\n\n"
+        f"✅ **Spam shuru!**\n"
         f"📊 Groups: `{len(groups)}`\n"
-        f"⏱ Gap: `{gap}s` between each group\n"
-        f"📝 Message: `{msg_text[:80]}{'...' if len(msg_text)>80 else ''}`\n\n"
-        f"🔁 Full round time: ~`{cycle_time_min} minutes`\n"
-        f"🛡️ Ek saath blast nahi — spam ban ka risk minimum\n\n"
-        f"🆔 Job ID: `{job_id}`\n"
-        f"🛑 Band karne ke liye: `/stopspread`"
-        + (f"\n\nℹ️ Pehle wala spread job `{prev}` stop kar diya." if prev else "")
+        f"📝 Message: `{parts[1][:80]}`\n"
+        f"⏱ Har group apne slowmode ke hisab se automatically spam hoga\n\n"
+        f"🛑 Band karne ke liye: `/stopspam`"
     )
 
 
-@bot_app.on_message(filters.command("stopspread") & filters.private & allowed_filter)
-async def stopspread_cmd(client, message: Message):
-    """Stop all running spread spam jobs for this user."""
+@bot_app.on_message(filters.command("stopspam") & filters.private & allowed_filter)
+async def stopspam_cmd(client, message: Message):
     uid = message.from_user.id
     count = stop_all_spread_spam(uid)
     if count:
-        await message.reply(
-            f"🛑 **Spread Spam Stopped!**\n"
-            f"`{count}` rolling job(s) band ho gayi."
-        )
+        await message.reply(f"🛑 Spam band — `{count}` job(s) stop ho gayi.")
     else:
-        await message.reply("ℹ️ Koi active spread spam nahi chal raha.\n`/listjobs` se regular jobs dekho.")
+        await message.reply("ℹ️ Koi active spam nahi chal raha.")
 
 # ── /stop ──────────────────────────────────────────────────────────────────────
 @bot_app.on_message(filters.command("stop") & filters.private & allowed_filter)
@@ -1335,11 +1393,7 @@ async def clearfail_cmd(client, message: Message):
         except ValueError:
             await message.reply("Numeric group ID ya 'all' do.")
 
-# ── Unauthorized ───────────────────────────────────────────────────────────────
-
-# keyword commands
-import time as _time
-
+# ── Keywords ───────────────────────────────────────────────────────────────────
 @bot_app.on_message(filters.command("addkeyword") & filters.private & allowed_filter)
 async def addkeyword_cmd(client, message: Message):
     parts = message.text.split(maxsplit=2)
@@ -1377,57 +1431,6 @@ async def listkeywords_cmd(client, message: Message):
     await message.reply(f"Keywords (Page {page+1}) — Total: {total}\n\n" + "\n".join(lines) + f"\n\nNext: /listkeywords {page+2}")
 
 
-@bot_app.on_message(filters.command("togglereply") & filters.private & allowed_filter)
-async def togglereply_cmd(client, message: Message):
-    from database import DB_NAME
-    import sqlite3
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    c.execute("SELECT value FROM settings WHERE key='auto_reply'")
-    row = c.fetchone()
-    current = int(row[0]) if row else 1
-    new_val = 0 if current else 1
-    c.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('auto_reply', ?)", (str(new_val),))
-    conn.commit()
-    conn.close()
-    status = "ON ✅" if new_val else "OFF ❌"
-    await message.reply(f"Auto-reply {status}")
-
-
-# Group auto-reply via user_app
-_last_reply: dict = {}
-REPLY_COOLDOWN = 10
-
-@user_app.on_message(filters.group & ~filters.me)
-async def group_auto_reply(client, message: Message):
-    if not message.text:
-        return
-    # Check auto_reply setting
-    from database import DB_NAME
-    import sqlite3, time
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    c.execute("SELECT value FROM settings WHERE key='auto_reply'")
-    row = c.fetchone()
-    conn.close()
-    if row and row[0] == '0':
-        return
-    chat_id = message.chat.id
-    if chat_id not in get_all_groups():
-        return
-    now = time.time()
-    if now - _last_reply.get(chat_id, 0) < REPLY_COOLDOWN:
-        return
-    reply = find_reply(message.text)
-    if reply:
-        try:
-            await asyncio.sleep(1)
-            await message.reply(reply)
-            _last_reply[chat_id] = time.time()
-            logger.info(f"Auto-replied in {chat_id}")
-        except Exception as e:
-            logger.error(f"Auto-reply error {chat_id}: {e}")
-
 @bot_app.on_message(filters.private & ~allowed_filter)
 async def unauthorized(client, message: Message):
     pass  # Silently ignore
@@ -1442,6 +1445,14 @@ async def main():
     user_clients[config.OWNER_ID] = user_app
     set_client(user_app, config.OWNER_ID)
     register_client(config.OWNER_ID, user_app)
+    # Save owner session string to DB for Railway restarts
+    try:
+        if not _owner_sstr:
+            sstr = await user_app.export_session_string()
+            update_user_session(config.OWNER_ID, phone=config.PHONE_NUMBER, session_string=sstr)
+            logger.info("Owner session string saved to DB.")
+    except Exception:
+        pass
     logger.info("Owner user client started.")
 
     # Load saved user sessions
@@ -1485,6 +1496,18 @@ async def main():
     logger.info("Bot client started.")
     logger.info("Bot running. Ctrl+C to stop.")
 
+    # Attach warn handler to all user clients
+    for _uid, _uc in list(user_clients.items()):
+        try:
+            _uc.add_handler(
+                pyrogram.handlers.MessageHandler(
+                    _handle_warn_for_client,
+                    filters.group & filters.incoming
+                )
+            )
+        except Exception:
+            pass
+
     try:
         await asyncio.Future()
     except (KeyboardInterrupt, asyncio.CancelledError):
@@ -1498,6 +1521,41 @@ async def main():
                 pass
         await bot_app.stop()
         logger.info("Shutdown complete.")
+
+
+# ── Protectron warn auto-backoff ─────────────────────────────────────────────
+WARN_KEYWORDS = ["warn", "warned", "warning", "⚠️", "🚨"]
+_me_cache: dict = {}
+
+def _is_warn_message(text: str, username: str, user_id: int) -> bool:
+    if not text:
+        return False
+    tl = text.lower()
+    has_warn = any(w in tl for w in WARN_KEYWORDS)
+    has_mention = (f"@{username.lower()}" in tl if username else False) or (str(user_id) in text)
+    return has_warn and has_mention
+
+async def _handle_warn_for_client(uclient, message):
+    try:
+        uid = uclient.me.id if uclient.me else None
+        if uid is None:
+            if id(uclient) in _me_cache:
+                me = _me_cache[id(uclient)]
+            else:
+                me = await uclient.get_me()
+                _me_cache[id(uclient)] = me
+        else:
+            me = uclient.me
+        text = message.text or message.caption or ""
+        if not _is_warn_message(text, me.username or "", me.id):
+            return
+        chat_id = message.chat.id
+        old = get_group_multiplier(chat_id)
+        new_mult = round(old * 2, 2)
+        set_group_multiplier(chat_id, new_mult)
+        logger.info(f"[warn-detect] {chat_id} multiplier {old} → {new_mult} (Protectron warn)")
+    except Exception as e:
+        logger.warning(f"[warn-detect] error: {e}")
 
 
 if __name__ == "__main__":

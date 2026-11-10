@@ -2,7 +2,9 @@
 import sqlite3
 from logger import logger
 
-DB_NAME = "announcer.db"
+import os
+
+DB_NAME = os.environ.get("DB_PATH", "announcer.db")
 
 
 def init_db():
@@ -82,6 +84,14 @@ def init_db():
                 keyword TEXT UNIQUE COLLATE NOCASE,
                 reply TEXT NOT NULL,
                 is_active INTEGER DEFAULT 1
+            )
+        ''')
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS group_custom_messages (
+                user_id INTEGER,
+                chat_id INTEGER,
+                message TEXT,
+                PRIMARY KEY (user_id, chat_id)
             )
         ''')
         conn.commit()
@@ -227,9 +237,11 @@ def add_group(chat_id, title="", added_by=0):
         conn = sqlite3.connect(DB_NAME)
         c = conn.cursor()
         c.execute("INSERT OR IGNORE INTO groups (chat_id, title, added_by) VALUES (?, ?, ?)", (chat_id, title, added_by))
-        c.execute("UPDATE groups SET title=? WHERE chat_id=? AND added_by=?", (title, chat_id, added_by))
+        inserted = c.rowcount > 0
+        if not inserted:
+            c.execute("UPDATE groups SET title=? WHERE chat_id=? AND added_by=?", (title, chat_id, added_by))
         conn.commit()
-        return True
+        return inserted
     except Exception as e:
         logger.error(f"add_group error: {e}")
         return False
@@ -259,12 +271,19 @@ def remove_group(chat_id, added_by=None):
 
 
 def get_all_groups(added_by=None):
-    # Ignoring added_by to share groups globally across all users
     conn = None
     try:
         conn = sqlite3.connect(DB_NAME)
         c = conn.cursor()
-        c.execute("SELECT chat_id FROM groups WHERE is_failed=0")
+        if added_by:
+            # Owner gets all groups, others get only their own
+            from config import OWNER_ID
+            if added_by == OWNER_ID:
+                c.execute("SELECT DISTINCT chat_id FROM groups WHERE is_failed=0")
+            else:
+                c.execute("SELECT chat_id FROM groups WHERE is_failed=0 AND added_by=?", (added_by,))
+        else:
+            c.execute("SELECT DISTINCT chat_id FROM groups WHERE is_failed=0")
         return [row[0] for row in c.fetchall()]
     except Exception as e:
         logger.error(f"get_all_groups error: {e}")
@@ -275,12 +294,18 @@ def get_all_groups(added_by=None):
 
 
 def get_all_groups_with_info(added_by=None):
-    # Ignoring added_by to share groups globally across all users
     conn = None
     try:
         conn = sqlite3.connect(DB_NAME)
         c = conn.cursor()
-        c.execute("SELECT chat_id, title, interval_multiplier, is_failed FROM groups")
+        if added_by:
+            from config import OWNER_ID
+            if added_by == OWNER_ID:
+                c.execute("SELECT chat_id, title, interval_multiplier, is_failed FROM groups GROUP BY chat_id")
+            else:
+                c.execute("SELECT chat_id, title, interval_multiplier, is_failed FROM groups WHERE added_by=?", (added_by,))
+        else:
+            c.execute("SELECT chat_id, title, interval_multiplier, is_failed FROM groups")
         return c.fetchall()
     except Exception as e:
         logger.error(f"get_all_groups_with_info error: {e}")
@@ -490,6 +515,34 @@ def find_reply(text):
         if conn: conn.close()
 
 
+
+def get_slowmode(chat_id):
+    conn = None
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        c = conn.cursor()
+        c.execute("SELECT slowmode_delay FROM groups WHERE chat_id=?", (chat_id,))
+        row = c.fetchone()
+        return row[0] if row and row[0] else 0
+    except Exception as e:
+        logger.error(f"get_slowmode error: {e}")
+        return 0
+    finally:
+        if conn: conn.close()
+
+
+def set_slowmode(chat_id, delay):
+    conn = None
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        c = conn.cursor()
+        c.execute("UPDATE groups SET slowmode_delay=? WHERE chat_id=?", (delay, chat_id))
+        conn.commit()
+    except Exception as e:
+        logger.error(f"set_slowmode error: {e}")
+    finally:
+        if conn: conn.close()
+
 def deactivate_schedule(job_id):
     conn = None
     try:
@@ -562,3 +615,59 @@ def clear_last_message_id(user_id: int, chat_id: int):
     finally:
         if conn:
             conn.close()
+
+
+# ── Group Custom Messages ─────────────────────────────────────────────────────
+
+def set_group_custom_message(user_id: int, chat_id: int, message: str):
+    conn = None
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        c = conn.cursor()
+        c.execute(
+            "INSERT OR REPLACE INTO group_custom_messages (user_id, chat_id, message) VALUES (?,?,?)",
+            (user_id, chat_id, message)
+        )
+        conn.commit()
+        return True
+    except Exception as e:
+        logger.error(f"set_group_custom_message error: {e}")
+        return False
+    finally:
+        if conn: conn.close()
+
+
+def get_group_custom_message(user_id: int, chat_id: int):
+    conn = None
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        c = conn.cursor()
+        c.execute(
+            "SELECT message FROM group_custom_messages WHERE user_id=? AND chat_id=?",
+            (user_id, chat_id)
+        )
+        row = c.fetchone()
+        return row[0] if row else None
+    except Exception as e:
+        logger.error(f"get_group_custom_message error: {e}")
+        return None
+    finally:
+        if conn: conn.close()
+
+
+def clear_group_custom_message(user_id: int, chat_id: int):
+    conn = None
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        c = conn.cursor()
+        c.execute(
+            "DELETE FROM group_custom_messages WHERE user_id=? AND chat_id=?",
+            (user_id, chat_id)
+        )
+        conn.commit()
+        return c.rowcount > 0
+    except Exception as e:
+        logger.error(f"clear_group_custom_message error: {e}")
+        return False
+    finally:
+        if conn: conn.close()

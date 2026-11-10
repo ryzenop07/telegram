@@ -10,13 +10,14 @@ from apscheduler.triggers.cron import CronTrigger
 from pyrogram.errors import (
     FloodWait, UserBannedInChannel, ChatWriteForbidden,
     SlowmodeWait, PeerIdInvalid, ChannelPrivate, PeerFlood,
-    ChatAdminRequired, UserNotParticipant
+    ChatAdminRequired, UserNotParticipant, ChannelInvalid
 )
 
 from database import (
     get_active_schedules, save_schedule, deactivate_schedule,
-    get_group_multiplier, set_group_multiplier, mark_group_failed,
-    get_last_message_id, set_last_message_id, clear_last_message_id
+    get_group_multiplier, set_group_multiplier, mark_group_failed, remove_group,
+    get_last_message_id, set_last_message_id, clear_last_message_id,
+    get_slowmode, set_slowmode, get_group_custom_message
 )
 from logger import logger
 
@@ -64,8 +65,7 @@ async def _send_with_retry(client, chat_id: int, message: str, multiplier: float
         prev_msg_id = get_last_message_id(user_id, chat_id)
         if prev_msg_id:
             try:
-                await client.delete_messages(chat_id, prev_msg_id)
-                logger.info(f"🗑️ Deleted prev msg {prev_msg_id} in {chat_id}")
+                await client.delete_messages(chat_id, [prev_msg_id])
             except Exception:
                 pass
             clear_last_message_id(user_id, chat_id)
@@ -83,9 +83,11 @@ async def _send_with_retry(client, chat_id: int, message: str, multiplier: float
     except FloodWait as e:
         wait = e.value + 5
         logger.warning(f"⏳ FloodWait {wait}s for {chat_id}")
+        # Backoff badha do — har FloodWait pe 1.5x
+        current = _group_backoff.get(chat_id, 0)
+        _group_backoff[chat_id] = min(int(max(wait, current) * 1.5), 3600)
+        logger.warning(f"🔺 Group {chat_id} backoff set to {_group_backoff[chat_id]}s")
         await asyncio.sleep(wait)
-        new_mult = round(multiplier * 1.5, 2)
-        set_group_multiplier(chat_id, new_mult)
         try:
             sent = await client.send_message(chat_id, message)
             _error_counts[chat_id] = 0
@@ -96,18 +98,11 @@ async def _send_with_retry(client, chat_id: int, message: str, multiplier: float
             return False
 
     except SlowmodeWait as e:
-        wait = e.value + 2
-        logger.warning(f"⏳ SlowmodeWait {wait}s for {chat_id}")
-        set_group_multiplier(chat_id, round(multiplier * 1.3, 2))
-        await asyncio.sleep(wait)
-        try:
-            sent = await client.send_message(chat_id, message)
-            _error_counts[chat_id] = 0
-            return True
-        except Exception as e2:
-            logger.error(f"SlowMode retry failed {chat_id}: {e2}")
-            _increment_error(chat_id)
-            return False
+        logger.warning(f"⏳ SlowmodeWait {e.value}s for {chat_id} — skipping")
+        set_slowmode(chat_id, e.value)
+        # Backoff bhi update karo
+        _group_backoff[chat_id] = max(_group_backoff.get(chat_id, 0), e.value)
+        return False
 
     except PeerFlood:
         logger.error("🚨 PeerFlood! Account spam ban. Pausing 5 minutes.")
@@ -116,12 +111,20 @@ async def _send_with_retry(client, chat_id: int, message: str, multiplier: float
         return False
 
     except (UserBannedInChannel, ChatWriteForbidden, PeerIdInvalid,
-            ChannelPrivate, ChatAdminRequired, UserNotParticipant) as e:
-        logger.error(f"❌ Permanent error {chat_id}: {type(e).__name__}")
-        _increment_error(chat_id)
+            ChannelPrivate, ChatAdminRequired, UserNotParticipant,
+            ChannelInvalid) as e:
+        logger.error(f"❌ Permanent error {chat_id}: {type(e).__name__} — removing from DB")
+        remove_group(chat_id)
+        _error_counts[chat_id] = 0
         return False
 
     except Exception as e:
+        err_str = str(e)
+        if "CHANNEL_INVALID" in err_str or "CHANNEL_PRIVATE" in err_str:
+            logger.error(f"❌ Permanent error (str match) {chat_id}: {e} — removing from DB")
+            remove_group(chat_id)
+            _error_counts[chat_id] = 0
+            return False
         logger.error(f"❌ Unexpected error {chat_id}: {e}")
         _increment_error(chat_id)
         return False
@@ -135,17 +138,17 @@ async def send_to_all_groups(chat_ids: list, message: str, base_interval: int = 
 
     for i, chat_id in enumerate(chat_ids):
         multiplier = get_group_multiplier(chat_id)
+        slowmode = get_slowmode(chat_id)
 
-        # Inter-group delay to avoid spam detection
         if i > 0:
-            await asyncio.sleep(INTER_GROUP_DELAY)
+            # 1-3s random gap between groups
+            gap = random.randint(1, 3)
+            # agar slowmode hai toh usse bhi add karo
+            wait = gap + (slowmode if slowmode > 0 else 0)
+            logger.info(f"Group {chat_id} — waiting {wait}s (gap={gap}s, slowmode={slowmode}s)")
+            await asyncio.sleep(wait)
 
-        # Extra delay if this group had previous issues
-        if base_interval > 0 and multiplier > 1.0:
-            extra = base_interval * (multiplier - 1.0)
-            await asyncio.sleep(min(extra, 60))  # cap at 60s extra
-
-        await _send_with_retry(client, chat_id, message, multiplier, user_id=user_id or 0, delete_prev=True)
+        await _send_with_retry(client, chat_id, message, multiplier, user_id=user_id or 0, delete_prev=False)
 
 
 def _increment_error(chat_id):
@@ -212,6 +215,8 @@ def stop_job(job_id: str):
 
 # ── Spread Spam (rolling one-by-one) ──────────────────────────────────────────
 _spread_tasks: dict = {}  # job_id → asyncio.Task
+_pinned_groups: dict = {}  # user_id → set of chat_ids being spammed via spamgroup
+_group_backoff: dict = {}  # chat_id → current backoff seconds
 
 # ── Anti-Ban Rule 1: Message Variation ──────────────────────────────────────
 # Invisible Unicode chars — visually identical, but technically unique messages
@@ -288,87 +293,91 @@ def _increment_daily(user_id: int):
 
 async def spread_spam_loop(job_id: str, chat_ids: list, message: str,
                            gap_seconds: int, user_id: int):
-    """
-    Rolling spam loop with full anti-ban protection:
-    - Rule 1: Auto-vary message (invisible chars) — unique per send
-    - Rule 2: Night pause 2AM–6AM IST automatically
-    - Rule 3: Daily limit 150 groups/day
-    - Rule 4: Randomized delay (80%–130% of gap)
-    """
-    client = get_client(user_id)
-    if not client:
-        logger.error(f"[spreadspam] No client for user {user_id}")
-        return
+    logger.info(f"[spam] {job_id} started — {len(chat_ids)} groups, auto slowmode")
 
-    idx = 0
-    total = len(chat_ids)
-    logger.info(f"[spreadspam] {job_id} started — {total} groups, ~{gap_seconds}s gap (randomized)")
+    now = asyncio.get_event_loop().time
+    next_send = {chat_id: now() for chat_id in chat_ids}
 
     while True:
         if job_id not in _spread_tasks:
             break
 
-        # ── Rule 2: Night Pause (2AM–6AM IST) ──
-        is_night, wait_night = _is_night_pause()
-        if is_night:
-            logger.info(f"[spreadspam] Night pause — resuming in {wait_night//60} mins (6AM IST)")
-            try:
-                await asyncio.sleep(wait_night + 60)  # +60s buffer
-            except asyncio.CancelledError:
-                break
-            continue
-
-        # ── Rule 3: Daily Limit ──
-        limit_status, limit_val = _check_daily_limit(user_id)
-        if limit_status == "stop":
-            logger.warning(f"[spreadspam] Daily limit {DAILY_HARD_LIMIT} reached. Pausing till midnight.")
-            try:
-                await asyncio.sleep(limit_val + 120)
-            except asyncio.CancelledError:
-                break
-            continue
-        if limit_status == "warn":
-            logger.warning(f"[spreadspam] Daily count {limit_val}/{DAILY_HARD_LIMIT} — approaching limit")
-
-        chat_id = chat_ids[idx % total]
-        multiplier = get_group_multiplier(chat_id)
-
-        # ── Rule 1: Vary message to avoid duplicate detection ──
-        varied_msg = _vary_message(message)
-
-        try:
-            await _send_with_retry(client, chat_id, varied_msg, multiplier, user_id=user_id)
-            _increment_daily(user_id)
-        except asyncio.CancelledError:
-            break
-        except Exception as e:
-            logger.warning(f"[spreadspam] Error sending to {chat_id}: {e}")
-
-        idx += 1
-
-        # ── Rule 4: Slight Randomized delay (+0 to +2 seconds) ──
-        # Taki ek time pe fixed na lage (e.g. 5 sec -> 5, 6, ya 7)
-        actual_wait = gap_seconds + random.randint(0, 2)
-        logger.info(f"[spreadspam] Waiting {actual_wait}s — group {idx % total + 1}/{total} | daily: {_daily_counters.get(user_id, {}).get('count', 0)}/{DAILY_HARD_LIMIT}")
-
-        try:
-            await asyncio.sleep(actual_wait)
-        except asyncio.CancelledError:
+        client = get_client(user_id)
+        if not client:
+            logger.error(f"[spam] No client for user {user_id} — stopping job")
             break
 
-    logger.info(f"[spreadspam] {job_id} stopped")
+        # Daily Limit check removed
+
+        sent_any = False
+        for chat_id in list(chat_ids):
+            if job_id not in _spread_tasks:
+                break
+            if now() < next_send.get(chat_id, 0):
+                continue
+
+            logger.info(f"[spam] Attempting send to {chat_id}")
+            slowmode = get_slowmode(chat_id)
+            multiplier = get_group_multiplier(chat_id)            custom_msg = get_group_custom_message(user_id, chat_id)
+            varied_msg = _vary_message(custom_msg if custom_msg else message)
+
+            sent = False
+            try:
+                sent = await _send_with_retry(client, chat_id, varied_msg, multiplier, user_id=user_id, delete_prev=False)
+                if sent:
+                    _increment_daily(user_id)
+                    sent_any = True
+                elif _error_counts.get(chat_id, 0) == 0 and not sent:
+                    # Permanently failed — remove from active list
+                    if chat_id in chat_ids:
+                        chat_ids.remove(chat_id)
+                        logger.info(f"[spam] {chat_id} removed from active list (permanent fail)")
+            except asyncio.CancelledError:
+                return
+            except Exception as e:
+                logger.warning(f"[spam] Error {chat_id}: {e}")
+
+            # Re-fetch slowmode in case SlowmodeWait just updated it
+            slowmode = get_slowmode(chat_id)
+            backoff = _group_backoff.get(chat_id, 0)
+            jitter = random.randint(1, 3)
+            wait = max(slowmode, backoff) + jitter
+            # Slowly reduce backoff over time (decay)
+            if backoff > 0:
+                _group_backoff[chat_id] = max(0, int(backoff * 0.8))
+                logger.info(f"📉 Group {chat_id} backoff decayed to {_group_backoff[chat_id]}s")
+            next_send[chat_id] = now() + wait
+            logger.info(f"[spam] {chat_id} next in {wait}s (slowmode={slowmode}s, backoff={backoff}s)")
+
+            try:
+                await asyncio.sleep(random.randint(1, 3))
+            except asyncio.CancelledError:
+                return
+
+        if not sent_any:
+            try:
+                await asyncio.sleep(1)
+            except asyncio.CancelledError:
+                break
+
+    logger.info(f"[spam] {job_id} stopped")
     _spread_tasks.pop(job_id, None)
 
 
 def start_spread_spam(chat_ids: list, message: str, gap_seconds: int,
-                      user_id: int) -> str:
-    """Start a rolling spread spam job. Returns job_id."""
+                      user_id: int, pinned: bool = False) -> str:
+    client = get_client(user_id)
+    if not client:
+        logger.error(f"[spreadspam] No client for user {user_id} — cannot start")
+        return None
+    if pinned:
+        _pinned_groups.setdefault(user_id, set()).update(chat_ids)
     job_id = f"spread_{user_id}_{uuid.uuid4()}"
     task = asyncio.create_task(
         spread_spam_loop(job_id, chat_ids, message, gap_seconds, user_id)
     )
     _spread_tasks[job_id] = task
-    logger.info(f"[spreadspam] Started {job_id}")
+    logger.info(f"[spreadspam] Started {job_id} pinned={pinned}")
     return job_id
 
 
@@ -383,11 +392,15 @@ def stop_spread_spam(job_id: str) -> bool:
 
 
 def stop_all_spread_spam(user_id: int) -> int:
-    """Stop all spread spam jobs for a user. Returns count stopped."""
     to_stop = [jid for jid in list(_spread_tasks) if f"_{user_id}_" in jid]
     for jid in to_stop:
         stop_spread_spam(jid)
+    _pinned_groups.pop(user_id, None)
     return len(to_stop)
+
+
+def get_pinned_groups(user_id: int) -> set:
+    return _pinned_groups.get(user_id, set())
 
 
 def get_spread_jobs(user_id: int = None) -> list:
