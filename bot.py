@@ -16,7 +16,10 @@ from pyrogram.enums import ChatType, ParseMode
 from logger import logger, patch_pyrogram_session
 
 # Patch Pyrogram to silence MESSAGE_IDS_EMPTY retry spam (library bug, harmless)
-patch_pyrogram_session()
+try:
+    patch_pyrogram_session()
+except Exception:
+    pass
 from database import (
     init_db, add_group, remove_group,
     get_all_groups, get_all_groups_with_info,
