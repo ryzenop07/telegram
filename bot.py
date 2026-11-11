@@ -40,15 +40,20 @@ from scheduler import (
 )
 import config
 
+# ── Init DB before any DB calls ───────────────────────────────────────────────
+init_db()
+
 # ── Multi-Client Storage ───────────────────────────────────────────────────────
 # user_id -> Client
 user_clients = {}
 # user_id -> {"phone": ..., "client": ..., "phone_code_hash": ..., "step": ...}
 login_states = {}
 
-# Owner session — use string if available in DB, else file
-_owner_session = get_user_session(config.OWNER_ID)
-_owner_sstr = _owner_session[2] if _owner_session and _owner_session[2] else None
+# Owner session — env var first (Railway), then DB, else phone login
+_owner_sstr = config.OWNER_SESSION or None
+if not _owner_sstr:
+    _owner_session = get_user_session(config.OWNER_ID)
+    _owner_sstr = _owner_session[2] if _owner_session and _owner_session[2] else None
 
 if _owner_sstr:
     user_app = Client(
@@ -1440,7 +1445,6 @@ async def unauthorized(client, message: Message):
 
 # ── Main ───────────────────────────────────────────────────────────────────────
 async def main():
-    init_db()
     start_scheduler()
 
     # Start Owner user client
