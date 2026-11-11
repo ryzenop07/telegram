@@ -51,9 +51,11 @@ login_states = {}
 
 # Owner session — env var first (Railway), then DB, else phone login
 _owner_sstr = config.OWNER_SESSION or None
+logger.info(f"[startup] OWNER_SESSION env={'SET' if _owner_sstr else 'NOT SET'}")
 if not _owner_sstr:
     _owner_session = get_user_session(config.OWNER_ID)
     _owner_sstr = _owner_session[2] if _owner_session and _owner_session[2] else None
+logger.info(f"[startup] _owner_sstr final={'SET' if _owner_sstr else 'MISSING — will try phone login'}")
 
 if _owner_sstr:
     user_app = Client(
