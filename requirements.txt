@@ -1,4 +1,4 @@
-pyrogram==2.0.106 # Or latest stable
-apscheduler==3.10.4 # Or latest stable
-pytz==2023.3.post1 # Or latest stable
-
+pyrogram==2.0.106
+apscheduler==3.10.4
+pytz==2023.3.post1
+TgCrypto==1.2.5
