@@ -1480,8 +1480,6 @@ async def main():
                 set_client(uclient, uid)
                 register_client(uid, uclient)
                 logger.info(f"Loaded session string for user {uid}")
-                # Auto-join all DB groups silently on startup (in background)
-                import asyncio
                 asyncio.create_task(auto_join_db_groups(uclient, uid))
             elif sname:
                 uclient = Client(
@@ -1495,8 +1493,6 @@ async def main():
                 set_client(uclient, uid)
                 register_client(uid, uclient)
                 logger.info(f"Loaded session file for user {uid}")
-                # Auto-join all DB groups silently on startup (in background)
-                import asyncio
                 asyncio.create_task(auto_join_db_groups(uclient, uid))
         except Exception as e:
             logger.error(f"Failed to start session for user {uid}: {e}")
