@@ -79,6 +79,13 @@ def init_db():
         ''')
 
         c.execute('''
+            CREATE TABLE IF NOT EXISTS super_owners (
+                user_id INTEGER PRIMARY KEY,
+                added_by INTEGER
+            )
+        ''')
+
+        c.execute('''
             CREATE TABLE IF NOT EXISTS keywords (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 keyword TEXT UNIQUE COLLATE NOCASE,
@@ -668,6 +675,66 @@ def clear_group_custom_message(user_id: int, chat_id: int):
         return c.rowcount > 0
     except Exception as e:
         logger.error(f"clear_group_custom_message error: {e}")
+        return False
+    finally:
+        if conn: conn.close()
+
+
+# ── Super Owner functions ─────────────────────────────────────────────────────
+
+def add_super_owner(user_id: int, added_by: int) -> bool:
+    conn = None
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        c = conn.cursor()
+        c.execute("INSERT OR IGNORE INTO super_owners (user_id, added_by) VALUES (?,?)", (user_id, added_by))
+        conn.commit()
+        return c.rowcount > 0
+    except Exception as e:
+        logger.error(f"add_super_owner error: {e}")
+        return False
+    finally:
+        if conn: conn.close()
+
+
+def remove_super_owner(user_id: int) -> bool:
+    conn = None
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        c = conn.cursor()
+        c.execute("DELETE FROM super_owners WHERE user_id=?", (user_id,))
+        conn.commit()
+        return c.rowcount > 0
+    except Exception as e:
+        logger.error(f"remove_super_owner error: {e}")
+        return False
+    finally:
+        if conn: conn.close()
+
+
+def get_super_owners() -> list:
+    conn = None
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        c = conn.cursor()
+        c.execute("SELECT user_id, added_by FROM super_owners")
+        return c.fetchall()
+    except Exception as e:
+        logger.error(f"get_super_owners error: {e}")
+        return []
+    finally:
+        if conn: conn.close()
+
+
+def is_super_owner(user_id: int) -> bool:
+    conn = None
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        c = conn.cursor()
+        c.execute("SELECT 1 FROM super_owners WHERE user_id=?", (user_id,))
+        return c.fetchone() is not None
+    except Exception as e:
+        logger.error(f"is_super_owner error: {e}")
         return False
     finally:
         if conn: conn.close()

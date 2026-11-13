@@ -28,7 +28,8 @@ from database import (
     update_user_session, get_user_session, get_all_user_sessions, clear_user_session,
     add_keyword, remove_keyword, get_all_keywords, get_keyword_count, find_reply,
     get_slowmode, set_slowmode,
-    get_group_multiplier, set_group_multiplier
+    get_group_multiplier, set_group_multiplier,
+    add_super_owner, remove_super_owner, get_super_owners, is_super_owner
 )
 from scheduler import (
     start_scheduler, stop_scheduler,
@@ -136,10 +137,19 @@ def allowed_only(_, __, message: Message):
     return message.from_user and is_user_allowed(message.from_user.id, config.OWNER_ID)
 
 def owner_only(_, __, message: Message):
+    """True for original owner OR super_owners."""
+    if not message.from_user:
+        return False
+    uid = message.from_user.id
+    return uid == config.OWNER_ID or is_super_owner(uid)
+
+def strict_owner_only(_, __, message: Message):
+    """True ONLY for original owner (for addsuperowner/removesuperowner)."""
     return message.from_user and message.from_user.id == config.OWNER_ID
 
 allowed_filter = filters.create(allowed_only)
 owner_filter = filters.create(owner_only)
+strict_owner_filter = filters.create(strict_owner_only)
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 def parse_cron(time_str):
@@ -184,12 +194,19 @@ async def join_and_add(target: str, added_by: int = 0):
 @bot_app.on_message(filters.command("help") & filters.private & allowed_filter)
 async def help_cmd(client, message: Message):
     is_owner = message.from_user.id == config.OWNER_ID
+    is_super = is_owner or is_super_owner(message.from_user.id)
     owner_section = (
-        "👤 **Users** _(sirf owner)_\n"
+        "👤 **Users** _(owner/super-owner)_\n"
         "`/adduser [user_id]` — Kisi ko access do\n"
         "`/removeuser [user_id]` — Access hatao\n"
         "`/listusers` — Allowed users dekho\n"
         "`/getsession [phone]` — Kisi bhi number ka session bot se generate karo\n\n"
+    ) if is_super else ""
+    strict_section = (
+        "👑 **Super Owner** _(sirf original owner)_\n"
+        "`/addsuperowner [user_id]` — Kisi ko super owner banao\n"
+        "`/removesuperowner [user_id]` — Super owner powers hatao\n"
+        "`/listsuperowners` — Super owners dekho\n\n"
     ) if is_owner else ""
 
     await message.reply(
@@ -225,6 +242,7 @@ async def help_cmd(client, message: Message):
         "`/clearfail all` — Saare failed groups clear karo\n"
         "_(Failed group mein spam tabhi hoga jab /clearfail karo)_\n\n"
 
+        + strict_section +
         + owner_section +
 
         "💡 **Examples**\n"
@@ -332,6 +350,54 @@ async def gspwd_cmd(client, message: Message):
         await status_msg.edit_text("❌ Galat password. Dobara: `/gspwd [pwd]`")
     except Exception as e:
         await status_msg.edit_text(f"❌ Error: `{e}`")
+
+
+# ── /addsuperowner ────────────────────────────────────────────────────────────
+@bot_app.on_message(filters.command("addsuperowner") & filters.private & strict_owner_filter)
+async def addsuperowner_cmd(client, message: Message):
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2:
+        await message.reply("Usage: /addsuperowner [user_id]")
+        return
+    try:
+        uid = int(parts[1].strip())
+        if uid == config.OWNER_ID:
+            await message.reply("Aap already original owner hain.")
+            return
+        # Auto-add to allowed_users bhi taaki bot use kar sake
+        add_allowed_user(uid, message.from_user.id)
+        if add_super_owner(uid, message.from_user.id):
+            await message.reply(f"✅ User `{uid}` ko **Super Owner** bana diya.\nUnhe owner jesi saari powers milegi.")
+        else:
+            await message.reply(f"ℹ️ User `{uid}` already Super Owner hai.")
+    except ValueError:
+        await message.reply("Numeric user ID chahiye.")
+
+
+@bot_app.on_message(filters.command("removesuperowner") & filters.private & strict_owner_filter)
+async def removesuperowner_cmd(client, message: Message):
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2:
+        await message.reply("Usage: /removesuperowner [user_id]")
+        return
+    try:
+        uid = int(parts[1].strip())
+        if remove_super_owner(uid):
+            await message.reply(f"✅ User `{uid}` ki Super Owner powers hata di.")
+        else:
+            await message.reply(f"❌ User `{uid}` Super Owner nahi tha.")
+    except ValueError:
+        await message.reply("Numeric user ID chahiye.")
+
+
+@bot_app.on_message(filters.command("listsuperowners") & filters.private & strict_owner_filter)
+async def listsuperowners_cmd(client, message: Message):
+    rows = get_super_owners()
+    if not rows:
+        await message.reply("Koi Super Owner nahi hai.")
+        return
+    lines = [f"• `{uid}` — added by `{ab}`" for uid, ab in rows]
+    await message.reply(f"👑 Super Owners ({len(rows)}):\n\n" + "\n".join(lines))
 
 
 # ── /adduser ───────────────────────────────────────────────────────────────────
