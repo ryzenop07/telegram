@@ -242,8 +242,8 @@ async def help_cmd(client, message: Message):
         "`/clearfail all` — Saare failed groups clear karo\n"
         "_(Failed group mein spam tabhi hoga jab /clearfail karo)_\n\n"
 
-        + strict_section +
-        + owner_section +
+        + strict_section
+        + owner_section
 
         "💡 **Examples**\n"
         "`/getsession +91XXXXXXXXXX` — Session generate karo\n"
