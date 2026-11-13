@@ -209,9 +209,8 @@ async def help_cmd(client, message: Message):
         "`/listsuperowners` — Super owners dekho\n\n"
     ) if is_owner else ""
 
-    await message.reply(
+    text = (
         "📋 **Bot Commands**\n\n"
-
         "🔐 **Account & Session**\n"
         "`/login [phone]` — Apna Telegram account connect karo\n"
         "`/otp [code]` — OTP enter karo\n"
@@ -219,38 +218,33 @@ async def help_cmd(client, message: Message):
         "`/session [string]` — Session string se connect karo\n"
         "`/myaccount` — Connected account status dekho\n"
         "`/logout` — Account disconnect karo\n\n"
-
         "👥 **Groups**\n"
         "`/addgroup [link/@username/id]` — Group add + auto join\n"
         "`/removegroup [group_id]` — Group remove karo\n"
         "`/listgroups` — Registered groups dekho\n"
         "`/syncgroups` — Joined groups DB mein sync karo\n"
         "`/autojoin` — DB ke saare groups mein rejoin karo\n\n"
-
         "📡 **Channel Scan**\n"
         "`/scanchannel [@username/id]` — Channel se group links nikal ke auto-join karo\n"
         "`/stopscan` — Scan band karo\n\n"
-
         "📨 **Spam**\n"
         "`/spam [message]` — Saare groups mein spam (failed groups skip honge)\n"
         "`/spamgroup [id] [seconds] [msg]` — Specific group mein fixed interval pe spam\n"
         "`/stopspam` — Spam band karo\n\n"
-
         "⚠️ **Failed Groups**\n"
         "`/faillist` — Failed groups ki list\n"
         "`/clearfail [group_id]` — Ek group fail list se hatao\n"
         "`/clearfail all` — Saare failed groups clear karo\n"
         "_(Failed group mein spam tabhi hoga jab /clearfail karo)_\n\n"
-
         + strict_section
         + owner_section
-
-        "💡 **Examples**\n"
+        + "💡 **Examples**\n"
         "`/getsession +91XXXXXXXXXX` — Session generate karo\n"
         "`/syncgroups` — Groups sync karo\n"
         "`/spam Aaj sale hai!` — Spam shuru\n"
         "`/spamgroup -100123 10 Hello!` — Specific group mein 10s pe spam"
     )
+    await message.reply(text)
 
 # ── /getsession ──────────────────────────────────────────────────────────────
 _getsession_states: dict = {}  # owner_id -> {phone, client, hash, step}
